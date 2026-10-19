@@ -1,5 +1,6 @@
 type ConfigTarget = {
   mcp?: unknown;
+  mcpServers?: unknown;
   permission?: unknown;
   permissions?: unknown;
   tools?: unknown;
@@ -18,72 +19,79 @@ function configTarget(input: unknown, output: unknown): ConfigTarget | null {
   return isRecord(input) ? input : null;
 }
 
-function serverNamesFromConfig(value: unknown): string[] {
-  if (!isRecord(value) || !isRecord(value.mcp)) return [];
-  return Object.keys(value.mcp).filter((name) => name.trim().length > 0);
-}
-
-function normalizedServerName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
-}
-
-function deniedPatterns(serverNames: Iterable<string>): string[] {
-  const patterns = new Set<string>(["mcp.*", "mcp:*", "mcp_*"]);
-  for (const name of serverNames) {
-    const normalized = normalizedServerName(name);
-    patterns.add(`${normalized}_*`);
-    patterns.add(`${normalized}___*`);
-    patterns.add(`mcp.${name}.*`);
-    patterns.add(`mcp:${name}:*`);
-    patterns.add(`tool.${normalized}_*`);
+function normalizeMcpEntry(raw: unknown): Record<string, unknown> | null {
+  if (!isRecord(raw)) return null;
+  const entry: Record<string, unknown> = { ...raw };
+  if (typeof entry.command === "string" && entry.command.trim().length > 0) {
+    const args = Array.isArray(entry.args)
+      ? entry.args.filter((a): a is string => typeof a === "string")
+      : [];
+    entry.command = [entry.command.trim(), ...args];
   }
-  return [...patterns];
-}
-
-function withDenyRules(value: unknown, patterns: string[]): Record<string, unknown> {
-  const existing = isRecord(value) ? value : {};
-  return Object.fromEntries([
-    ...Object.entries(existing),
-    ...patterns.map((pattern) => [pattern, "deny"] as const),
-  ]);
-}
-
-function isDeniedMcpTool(tool: string, serverNames: Iterable<string>): boolean {
-  if (tool.startsWith("mcp_") || tool.startsWith("mcp.") || tool.startsWith("mcp:")) return true;
-  return [...serverNames].some((name) => {
-    const normalized = normalizedServerName(name);
-    return tool === normalized
-      || tool.startsWith(`${normalized}_`)
-      || tool.startsWith(`${normalized}___`);
-  });
+  if (isRecord(entry.env) && !entry.environment) {
+    entry.environment = entry.env;
+  }
+  if (!entry.type) {
+    if (entry.url) {
+      entry.type = "remote";
+    } else if (entry.command) {
+      entry.type = "local";
+    }
+  } else if (entry.type === "stdio") {
+    entry.type = "local";
+  }
+  if (entry.enabled === undefined && entry.disabled === undefined) {
+    entry.enabled = true;
+  } else if (typeof entry.disabled === "boolean") {
+    entry.enabled = !entry.disabled;
+  }
+  return entry;
 }
 
 /**
- * Engine-side MCP fence. HTTP checks protect OmniRush routes, while these
- * hooks cover workspace/global config discovery inside a managed v1 engine.
- * The config hook supports both OpenCode hook shapes, and the execution hook
- * catches the actual `<server>_<tool>` IDs rather than relying on `mcp.*`.
+ * Engine-side MCP adapter. Normalizes mcp and mcpServers config discovery
+ * and ensures MCP tools are permitted in the OpenCode agent loop.
  */
 export default async function omnirushMcpPolicy() {
-  const serverNames = new Set<string>();
-  const applyFence = (input: unknown, output?: unknown): void => {
+  const applyConfig = (input: unknown, output?: unknown): void => {
     const target = configTarget(input, output);
     if (!target) return;
-    for (const name of serverNamesFromConfig(target)) serverNames.add(name);
-    const patterns = deniedPatterns(serverNames);
-    target.mcp = {};
-    target.permission = withDenyRules(target.permission, patterns);
-    target.permissions = withDenyRules(target.permissions, patterns);
-    target.tools = withDenyRules(target.tools, patterns);
+
+    const mcpMap: Record<string, unknown> = isRecord(target.mcp) ? { ...target.mcp } : {};
+
+    if (isRecord(target.mcpServers)) {
+      for (const [name, serverConfig] of Object.entries(target.mcpServers)) {
+        const normalized = normalizeMcpEntry(serverConfig);
+        if (normalized) {
+          mcpMap[name] = normalized;
+        }
+      }
+    }
+
+    for (const [name, serverConfig] of Object.entries(mcpMap)) {
+      const normalized = normalizeMcpEntry(serverConfig);
+      if (normalized) {
+        mcpMap[name] = normalized;
+      }
+    }
+
+    target.mcp = mcpMap;
+
+    const permissions = isRecord(target.permission) ? target.permission : {};
+    target.permission = {
+      ...permissions,
+      "mcp.*": "allow",
+      "mcp:*": "allow",
+      "mcp_*": "allow",
+    };
   };
 
   return {
     config: async (input: unknown, output?: unknown) => {
-      applyFence(input, output);
+      applyConfig(input, output);
     },
-    "tool.execute.before": async (input: ToolBeforeInput) => {
-      if (typeof input.tool !== "string" || !isDeniedMcpTool(input.tool, serverNames)) return;
-      throw new Error("MCP tools are disabled in OmniRush.ai.");
+    "tool.execute.before": async (_input: ToolBeforeInput) => {
+      // MCP tools are permitted
     },
   };
 }

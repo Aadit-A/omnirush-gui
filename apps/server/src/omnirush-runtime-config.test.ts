@@ -45,7 +45,7 @@ let previousDb: string | undefined;
 
 afterEach(async () => {
   while (cleanups.length) cleanups.pop()?.();
-  while (roots.length) await rm(roots.pop()!, { recursive: true, force: true });
+  while (roots.length) await rm(roots.pop()!, { recursive: true, force: true }).catch(() => {});
   if (previousDb === undefined) delete process.env.OMNIRUSH_RUNTIME_DB;
   else process.env.OMNIRUSH_RUNTIME_DB = previousDb;
 });
@@ -82,7 +82,7 @@ async function readConfigFile(config: ServerConfig): Promise<Record<string, unkn
 }
 
 describe("omnirush runtime config file", () => {
-  test("permanent MCP ban omits MCP and adds an engine permission fence", () => {
+  test("allows MCP in snapshot and sets engine permission to allow", () => {
     const parsed = buildOmniRushRuntimeConfigObjectFromSnapshot(
       { mcp: { posthog: { type: "remote", url: "https://mcp.example" } } },
       undefined,
@@ -91,8 +91,8 @@ describe("omnirush runtime config file", () => {
       undefined,
       undefined,
     );
-    expect(parsed.mcp).toEqual({});
-    expect(parsed.permission).toMatchObject({ "mcp.*": "deny" });
+    expect(parsed.mcp).toEqual({ posthog: { type: "remote", url: "https://mcp.example", enabled: true } });
+    expect(parsed.permission).toMatchObject({ "mcp.*": "allow" });
     const plugins = Array.isArray(parsed.plugin) ? parsed.plugin : [];
     expect(plugins.some((plugin) => typeof plugin === "string" && plugin.includes("omnirush-mcp-policy"))).toBe(true);
     expect(String(plugins.at(-1))).toContain("omnirush-mcp-policy");
@@ -117,16 +117,16 @@ describe("omnirush runtime config file", () => {
     });
     // The built-in git workflow rules come first; the organization's execution
     // rules are appended last so the engine's last-match-wins evaluation keeps them.
-    const permission = { bash: { ...gitWorkflowPermissionRules(), "*": "deny", "curl *": "deny" }, "mcp.*": "deny", webfetch: "deny", websearch: "deny" };
+    const permission = { bash: { ...gitWorkflowPermissionRules(), "*": "deny", "curl *": "deny" }, "mcp.*": "allow", webfetch: "deny", websearch: "deny" };
     expect(parsed.permission).toEqual(permission);
     expect(Object.keys((parsed.permission as { bash: Record<string, string> }).bash).slice(-2)).toEqual(["*", "curl *"]);
     expect(parsed.agent).toMatchObject({ omnirush: { permission } });
     expect(parsed.managedPolicy).toBeUndefined();
-    expect(buildOmniRushRuntimeConfigObjectFromSnapshot({}).permission).toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "deny" });
+    expect(buildOmniRushRuntimeConfigObjectFromSnapshot({}).permission).toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "allow" });
   });
 
   test("full approval mode allows every permission category; the environment overrides the setting", () => {
-    const permission = { bash: { "*": "allow" }, read: { "*": "allow" }, edit: "allow", "mcp.*": "deny", webfetch: "allow", websearch: "allow", doom_loop: "allow", external_directory: "allow" };
+    const permission = { bash: { "*": "allow" }, read: { "*": "allow" }, edit: "allow", "mcp.*": "allow", webfetch: "allow", websearch: "allow", doom_loop: "allow", external_directory: "allow" };
     const full = buildOmniRushRuntimeConfigObjectFromSnapshot(
       { approvals: { mode: "full" }, permission: { external_directory: { "/Users/sam/Docs": "allow" } } },
       undefined,
@@ -155,12 +155,12 @@ describe("omnirush runtime config file", () => {
 
     // OMNIRUSH_APPROVALS on the server process wins in both directions; the default stays guarded.
     expect(buildOmniRushRuntimeConfigObjectFromSnapshot({ approvals: { mode: "full" } }, undefined, { OMNIRUSH_APPROVALS: "guarded" }).permission)
-      .toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "deny" });
+      .toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "allow" });
     expect(buildOmniRushRuntimeConfigObjectFromSnapshot({}, undefined, { OMNIRUSH_APPROVALS: "full" }).permission).toEqual(permission);
-    expect(buildOmniRushRuntimeConfigObjectFromSnapshot({}, undefined, {}).permission).toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "deny" });
+    expect(buildOmniRushRuntimeConfigObjectFromSnapshot({}, undefined, {}).permission).toEqual({ bash: gitWorkflowPermissionRules(), "mcp.*": "allow" });
   });
 
-  test("omits global-row MCPs while writing omnirush defaults into the file", async () => {
+  test("writes global-row MCPs and omnirush defaults into the file", async () => {
     const { config } = await setup();
     await writeGlobalRuntimeOpencodeConfig(config, (current) => ({
       ...current,
@@ -174,7 +174,8 @@ describe("omnirush runtime config file", () => {
     expect(path).toBe(omnirushRuntimeConfigFilePath(config));
 
     const parsed = await readConfigFile(config);
-    expect(parsed.mcp).toEqual({});
+    const mcp = parsed.mcp as Record<string, Record<string, unknown>>;
+    expect(mcp.posthog?.enabled).toBe(true);
     expect(parsed.default_agent).toBe("omnirush");
     expect(Array.isArray(parsed.plugin)).toBe(true);
     if (!Array.isArray(parsed.plugin)) throw new Error("Expected runtime plugins");
@@ -334,7 +335,7 @@ describe("omnirush runtime config file", () => {
         "ui-bundled": bundled,
       },
     });
-    expect(built.mcp).toEqual({});
+    expect(built.mcp).toEqual({ "ui-bundled": { ...bundled, enabled: true } });
   });
 
   test("omnirush prompt states identity, repo memory, artifacts, and Connect routing once, without the removed Memory Bank", async () => {
@@ -555,9 +556,14 @@ describe("omnirush runtime config file", () => {
     }));
 
     // The refresh is fire-and-forget; poll briefly for the rewrite.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const parsed = await readConfigFile(config);
-    expect(parsed.mcp).toEqual({});
+    let mcp: Record<string, Record<string, unknown>> = {};
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const parsed = await readConfigFile(config);
+      mcp = (parsed.mcp ?? {}) as Record<string, Record<string, unknown>>;
+      if (mcp.stripe) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(mcp.stripe?.enabled).toBe(false);
   });
 
   test("workspace runtime writes do not rewrite the file", async () => {

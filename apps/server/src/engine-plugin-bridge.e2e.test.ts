@@ -6,7 +6,6 @@ import { join, resolve } from "node:path";
 import { createManagedOpencodeServer, type ManagedOpencodeServer } from "./managed-opencode.js";
 import {
   omnirushAnthropicToolSchemaPluginPath,
-  omnirushMcpPolicyPluginPath,
   omnirushTitleRecoveryPluginPath,
 } from "./omnirush-extensions-plugin-path.js";
 
@@ -144,7 +143,6 @@ rl.on("line", (line) => {
       plugin: [
         omnirushTitleRecoveryPluginPath(),
         omnirushAnthropicToolSchemaPluginPath(),
-        omnirushMcpPolicyPluginPath(),
       ],
     }));
     engine = await createManagedOpencodeServer({
@@ -196,27 +194,19 @@ rl.on("line", (line) => {
     console.log("title requests: optional parameters", JSON.stringify(refused));
   }, 90_000);
 
-  test("a configured MCP never reaches the engine inventory or provider tools", async () => {
+  test("an MCP tool with a top-level anyOf reaches the Anthropic API flattened", async () => {
     seen.length = 0;
-    const status = await waitFor(async () => {
-      const response = await engineFetch("/mcp");
-      if (!response.ok) return null;
-      return (await response.json()) as Record<string, unknown>;
-    }, "the engine MCP inventory");
-    expect(status.anyof).toBeUndefined();
-    expect(status.blender).toBeUndefined();
-    expect(status.supabase).toBeUndefined();
-
+    await waitFor(async () => {
+      const status = (await (await engineFetch("/mcp")).json()) as Record<string, { status: string }>;
+      return status.anyof?.status === "connected";
+    }, "the MCP server");
     await prompt({ providerID: "anth", modelID: "claude-mock" }, "Use the export tool.");
-    await waitFor(async () => seen.find((entry) => entry.path === "/v1/messages"), "an Anthropic request");
-    const requests = seen.filter((entry) => entry.path === "/v1/messages");
-    expect(requests.length).toBeGreaterThan(0);
-    for (const request of requests) {
-      const tools = Array.isArray(request.body.tools) ? request.body.tools : [];
-      expect(tools.some((entry) => typeof entry === "object" && entry !== null
-        && "name" in entry && typeof entry.name === "string" && entry.name.endsWith("export_batch"))).toBe(false);
-    }
-    expect(existsSync(join(data, "blender-started"))).toBe(false);
-    expect(existsSync(join(data, "supabase-started"))).toBe(false);
+    const request = await waitFor(async () => seen.find((entry) => entry.path === "/v1/messages" && Array.isArray(entry.body.tools) && entry.body.tools.length > 0), "an Anthropic request with tools");
+    const tool = (request.body.tools as Array<{ name: string; input_schema: Record<string, unknown> }>).find((entry) => entry.name.endsWith("export_batch"));
+    expect(tool).toBeDefined();
+    expect(tool!.input_schema.anyOf).toBeUndefined();
+    expect(tool!.input_schema.type).toBe("object");
+    expect(Object.keys(tool!.input_schema.properties as object).sort()).toEqual(["id", "name"]);
+    for (const entry of seen) expect(entry.headers[HEADER]).toBeUndefined();
   }, 90_000);
 });

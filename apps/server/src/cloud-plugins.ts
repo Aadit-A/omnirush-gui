@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import type { ServerConfig } from "./types.js";
 import { ApiError } from "./errors.js";
 import { parseFrontmatter, buildFrontmatter } from "./frontmatter.js";
-import { removeMcp } from "./mcp.js";
+import { addMcp, removeMcp } from "./mcp.js";
 import { createWorkspaceKvStore, isRecord } from "./workspace-kv-store.js";
 
 const OPENCODE_SKILL_NAME_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -561,7 +561,19 @@ export async function installCloudPlugin(input: {
     }
 
     if (object.objectType === "mcp") {
-      warnings.push(mcpDisabledWarning(object.title));
+      const configs = pluginMcpConfigsFromPayload(object, namespace);
+      if (configs.length === 0) warnings.push(mcpNoConfigWarning(object.title));
+      for (const config of configs) {
+        await addMcp(input.serverConfig, input.workspaceId, config.name, config.config);
+        files.push({
+          configObjectId: object.id,
+          versionId: version?.id ?? null,
+          objectType: object.objectType,
+          title: object.title,
+          path: config.path,
+          updatedAt: object.updatedAt,
+        });
+      }
       continue;
     }
 

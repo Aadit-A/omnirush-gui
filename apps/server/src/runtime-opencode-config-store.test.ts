@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { resolveApprovalMode } from "./approval-mode.js";
 import { managedDesktopPolicy } from "./managed-desktop-policy.js";
 import { policyRequestActions } from "./managed-policy-rules.js";
-import { listMcp } from "./mcp.js";
+import { addMcp, listMcp, setMcpEnabled } from "./mcp.js";
 import { buildOmniRushRuntimeConfig } from "./omnirush-runtime-config.js";
 import { readOmniRushWorkspaceConfig } from "./omnirush-workspace-config-store.js";
 import { addPlugin, listPlugins, removePlugin } from "./plugins.js";
@@ -68,7 +68,7 @@ async function withWorkspace(fn: (input: { root: string; config: ServerConfig })
     else process.env.OMNIRUSH_RUNTIME_DB = previousDb;
     if (previousOpencodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
     else process.env.OPENCODE_CONFIG_DIR = previousOpencodeConfigDir;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -122,33 +122,30 @@ describe("runtime OpenCode config store", () => {
           ...current,
           mcp: { posthog: { type: "remote", url: "https://mcp.posthog.com/mcp", enabled: false } },
         }));
-        expect(third.changed).toBe(false);
-        expect(third.config).toEqual(first.config);
-        expect(writes).toBe(1);
+        expect(third.changed).toBe(true);
+        expect(writes).toBe(2);
       } finally {
         unsubscribe();
       }
     });
   });
 
-  test("drops MCP writes without rewriting workspace files", async () => {
+  test("stores MCP changes in the OmniRush.ai runtime DB without rewriting workspace files", async () => {
     await withWorkspace(async ({ root, config }) => {
       const opencodePath = join(root, "opencode.jsonc");
       const opencode = '{\n  "mcp": {\n    "project": { "type": "remote", "url": "https://project.example/mcp" }\n  }\n}\n';
       await writeFile(opencodePath, opencode, "utf8");
 
-      const result = await writeRuntimeOpencodeConfig(config, WORKSPACE_ID, (current) => ({
-        ...current,
-        mcp: { runtime: { type: "remote", url: "https://runtime.example/mcp", enabled: true } },
-      }));
+      await addMcp(config, WORKSPACE_ID, "runtime", { type: "remote", url: "https://runtime.example/mcp", enabled: true });
+      await setMcpEnabled(config, WORKSPACE_ID, "runtime", false);
 
       expect(await readFile(opencodePath, "utf8")).toBe(opencode);
       await expectMissing(join(root, ".opencode", "omnirush.json"));
-      expect(result.changed).toBe(true);
-      expect((await readRuntimeOpencodeConfig(config, WORKSPACE_ID)).mcp).toBeUndefined();
+      expect((await readRuntimeOpencodeConfig(config, WORKSPACE_ID)).mcp?.runtime?.enabled).toBe(false);
 
       const items = await listMcp(config, WORKSPACE_ID, root);
-      expect(items).toEqual([]);
+      expect(items.map((item) => `${item.name}:${item.source}`)).toContain("project:config.project");
+      expect(items.map((item) => `${item.name}:${item.source}`)).toContain("runtime:config.remote");
     });
   });
 
@@ -183,12 +180,13 @@ describe("runtime OpenCode config store", () => {
   test("malformed user opencode config does not block runtime config reads", async () => {
     await withWorkspace(async ({ root, config }) => {
       await writeFile(join(root, "opencode.jsonc"), '{ "mcp": {\n}\n}\n}\n', "utf8");
+      await addMcp(config, WORKSPACE_ID, "runtime", { type: "remote", url: "https://runtime.example/mcp", enabled: true });
       await addPlugin(config, "runtime-plugin");
 
       const mcpItems = await listMcp(config, WORKSPACE_ID, root);
       const pluginItems = await listPlugins(config, WORKSPACE_ID, root, false);
 
-      expect(mcpItems).toEqual([]);
+      expect(mcpItems.map((item) => item.name)).toEqual(["runtime"]);
       expect(pluginItems.items.map((item) => item.spec)).toEqual(["runtime-plugin"]);
     });
   });
@@ -247,6 +245,7 @@ describe("runtime OpenCode config store", () => {
         plugin: ["plugin-a", "plugin-shared"],
         disabled_providers: ["anthropic"],
         permission: { external_directory: { "/folders/a": "allow" } },
+        mcp: { notion: { type: "remote", url: "https://notion.example/mcp" } },
         provider: { "user-lmstudio": { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://a.example/v1" } }, local: { npm: "stale-copy" } },
         default_agent: "omnirush",
       }));
@@ -287,7 +286,7 @@ describe("runtime OpenCode config store", () => {
       expect(workspaceA.disabled_providers).toBeUndefined();
       expect(workspaceA.permission).toBeUndefined();
       expect(workspaceA.provider).toBeUndefined();
-      expect(workspaceA.mcp).toBeUndefined();
+      expect(workspaceA.mcp?.notion?.url).toBe("https://notion.example/mcp");
       expect(workspaceA.default_agent).toBe("omnirush");
       expect(await readRuntimeOpencodeConfig(config, "ws_b")).toEqual({});
 
@@ -314,13 +313,16 @@ describe("runtime OpenCode config store", () => {
     await withWorkspace(async ({ root, config }) => {
       await mkdir(join(root, ".opencode"), { recursive: true });
       await writeFile(join(root, ".opencode", "omnirush.json"), "{ invalid\n", "utf8");
+      await addMcp(config, WORKSPACE_ID, "runtime", { type: "remote", url: "https://runtime.example/mcp" });
       const server = await startServer(config) as Served;
       try {
         const response = await fetch(`http://127.0.0.1:${server.port}/workspace/${WORKSPACE_ID}/runtime-config`, {
           headers: { authorization: `Bearer ${config.token}` },
         });
         expect(response.status).toBe(200);
-        expect(await response.json()).toMatchObject({ runtimeKeys: [] });
+        expect(await response.json()).toMatchObject({
+          runtimeKeys: ["mcp"],
+        });
       } finally {
         await server.stop(true);
       }

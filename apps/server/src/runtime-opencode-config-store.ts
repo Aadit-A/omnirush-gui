@@ -23,6 +23,7 @@ export type RuntimeOpencodeConfig = {
   plugin?: string[];
   disabled_providers?: string[];
   mcp?: Record<string, Record<string, unknown>>;
+  mcpServers?: Record<string, unknown>;
   permission?: {
     external_directory?: Record<string, unknown>;
   };
@@ -35,6 +36,35 @@ export function isEngineGlobalRuntimeConfigId(workspaceId: string): boolean {
   return workspaceId === ENGINE_GLOBAL_RUNTIME_CONFIG_ID;
 }
 
+export function normalizeMcpServerConfig(entry: unknown): Record<string, unknown> | null {
+  if (!isRecord(entry)) return null;
+  const normalized: Record<string, unknown> = { ...entry };
+  if (typeof normalized.command === "string" && normalized.command.trim().length > 0) {
+    const args = Array.isArray(normalized.args)
+      ? normalized.args.filter((arg): arg is string => typeof arg === "string")
+      : [];
+    normalized.command = [normalized.command.trim(), ...args];
+  }
+  if (isRecord(normalized.env) && !normalized.environment) {
+    normalized.environment = normalized.env;
+  }
+  if (!normalized.type) {
+    if (normalized.url) {
+      normalized.type = "remote";
+    } else if (normalized.command) {
+      normalized.type = "local";
+    }
+  } else if (normalized.type === "stdio") {
+    normalized.type = "local";
+  }
+  if (normalized.enabled === undefined && normalized.disabled === undefined) {
+    normalized.enabled = true;
+  } else if (typeof normalized.disabled === "boolean") {
+    normalized.enabled = !normalized.disabled;
+  }
+  return normalized;
+}
+
 function normalizeRuntimeOpencodeConfig(value: unknown): RuntimeOpencodeConfig {
   if (!isRecord(value)) return {};
   const defaultAgent = typeof value.default_agent === "string" ? value.default_agent : undefined;
@@ -42,7 +72,21 @@ function normalizeRuntimeOpencodeConfig(value: unknown): RuntimeOpencodeConfig {
   const disabledProviders = Array.isArray(value.disabled_providers)
     ? value.disabled_providers.filter((item) => typeof item === "string")
     : undefined;
-  const mcp = isRecord(value.mcp) ? value.mcp as Record<string, Record<string, unknown>> : undefined;
+  const mcpEntries: Record<string, Record<string, unknown>> = {};
+  if (isRecord(value.mcp)) {
+    for (const [k, v] of Object.entries(value.mcp)) {
+      const normalized = normalizeMcpServerConfig(v);
+      if (normalized) mcpEntries[k] = normalized;
+    }
+  }
+  if (isRecord(value.mcpServers)) {
+    for (const [k, v] of Object.entries(value.mcpServers)) {
+      const normalized = normalizeMcpServerConfig(v);
+      if (normalized && !mcpEntries[k]) mcpEntries[k] = normalized;
+    }
+  }
+  const mcp = Object.keys(mcpEntries).length > 0 ? mcpEntries : undefined;
+  const mcpServers = isRecord(value.mcpServers) ? (value.mcpServers as Record<string, unknown>) : undefined;
   const permission = isRecord(value.permission) ? value.permission : undefined;
   const externalDirectory = permission && isRecord(permission.external_directory) ? permission.external_directory : undefined;
   const provider = isRecord(value.provider) ? value.provider : undefined;
@@ -55,15 +99,15 @@ function normalizeRuntimeOpencodeConfig(value: unknown): RuntimeOpencodeConfig {
     ...(plugin ? { plugin } : {}),
     ...(disabledProviders ? { disabled_providers: disabledProviders } : {}),
     ...(mcp ? { mcp } : {}),
+    ...(mcpServers ? { mcpServers } : {}),
     ...(externalDirectory ? { permission: { external_directory: externalDirectory } } : {}),
     ...(provider ? { provider } : {}),
   };
 }
 
-/** Remove MCP before a runtime config crosses an engine or diagnostics boundary. */
+/** Return runtime config (MCP is preserved). */
 export function withoutMcpRuntimeConfig(config: RuntimeOpencodeConfig): RuntimeOpencodeConfig {
-  const { mcp: _mcp, ...rest } = config;
-  return rest;
+  return config;
 }
 
 function parseRuntimeOpencodeConfig(configJson: string): RuntimeOpencodeConfig {
@@ -106,7 +150,22 @@ export function runtimeDisabledProviderList(config: RuntimeOpencodeConfig): stri
 }
 
 export function runtimeMcpMap(config: RuntimeOpencodeConfig): Record<string, Record<string, unknown>> {
-  return isRecord(config.mcp) ? config.mcp as Record<string, Record<string, unknown>> : {};
+  const result: Record<string, Record<string, unknown>> = {};
+  if (isRecord(config.mcp)) {
+    for (const [k, v] of Object.entries(config.mcp)) {
+      const normalized = normalizeMcpServerConfig(v);
+      if (normalized) result[k] = normalized;
+    }
+  }
+  if (isRecord(config.mcpServers)) {
+    for (const [k, v] of Object.entries(config.mcpServers)) {
+      if (!result[k]) {
+        const normalized = normalizeMcpServerConfig(v);
+        if (normalized) result[k] = normalized;
+      }
+    }
+  }
+  return result;
 }
 
 export function runtimeProviderMap(config: RuntimeOpencodeConfig): Record<string, Record<string, unknown>> {
@@ -264,6 +323,14 @@ export function mergeRuntimeOpencodeConfigLayers(
     ...runtimeProviderMap(base),
     ...runtimeProviderMap(overlay),
   };
+  const mcp = {
+    ...runtimeMcpMap(base),
+    ...runtimeMcpMap(overlay),
+  };
+  const mcpServers = {
+    ...(isRecord(base.mcpServers) ? base.mcpServers : {}),
+    ...(isRecord(overlay.mcpServers) ? overlay.mcpServers : {}),
+  };
 
   return normalizeRuntimeOpencodeConfig({
     ...(base.managedPolicy ? { managedPolicy: base.managedPolicy } : {}),
@@ -273,6 +340,8 @@ export function mergeRuntimeOpencodeConfigLayers(
     ...(base.default_agent || overlay.default_agent ? { default_agent: overlay.default_agent ?? base.default_agent } : {}),
     ...(plugin.length ? { plugin } : {}),
     ...(disabledProviders.length ? { disabled_providers: disabledProviders } : {}),
+    ...(Object.keys(mcp).length ? { mcp } : {}),
+    ...(Object.keys(mcpServers).length ? { mcpServers } : {}),
     ...(Object.keys(permission).length ? { permission } : {}),
     ...(Object.keys(provider).length ? { provider } : {}),
   });
@@ -621,6 +690,15 @@ export function mergeOpencodeConfigs(
     ? persistedPermission.external_directory
     : {};
   const runtimeProvider = runtimeProviderMap(runtime);
+  const persistedMcp = isRecord(persisted.mcp) ? (persisted.mcp as Record<string, unknown>) : {};
+  const persistedMcpServers = isRecord(persisted.mcpServers) ? (persisted.mcpServers as Record<string, unknown>) : {};
+  const mergedMcp: Record<string, Record<string, unknown>> = {};
+  for (const [k, v] of Object.entries({ ...persistedMcpServers, ...persistedMcp, ...runtimeMcpMap(runtime) })) {
+    const normalized = normalizeMcpServerConfig(v);
+    if (normalized) {
+      mergedMcp[k] = normalized;
+    }
+  }
   return {
     ...persisted,
     plugin: [
@@ -631,7 +709,7 @@ export function mergeOpencodeConfigs(
       ...(Array.isArray(persisted.disabled_providers) ? persisted.disabled_providers.filter((item) => typeof item === "string") : []),
       ...runtimeDisabledProviderList(runtime),
     ].filter((item, index, list) => list.indexOf(item) === index),
-    mcp: {},
+    mcp: mergedMcp,
     permission: {
       ...persistedPermission,
       external_directory: {

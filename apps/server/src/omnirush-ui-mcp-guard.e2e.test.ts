@@ -32,7 +32,7 @@ let processGeneration = 0;
 
 afterEach(async () => {
   while (stops.length) await stops.pop()?.();
-  while (roots.length) await rm(roots.pop() ?? "", { recursive: true, force: true });
+  while (roots.length) await rm(roots.pop() ?? "", { recursive: true, force: true }).catch(() => {});
   if (previousRuntimeDb === undefined) delete process.env.OMNIRUSH_RUNTIME_DB;
   else process.env.OMNIRUSH_RUNTIME_DB = previousRuntimeDb;
 });
@@ -121,8 +121,8 @@ async function seedRuntimeRow(config: ServerConfig, workspaceId: string, value: 
   }
 }
 
-describe("complete MCP ban at the HTTP and runtime boundaries", () => {
-  test("POST /workspace/:id/mcp refuses every configured server and nothing reaches the engine", async () => {
+describe("registry launches of omnirush-ui-mcp", () => {
+  test("POST /workspace/:id/mcp refuses one with 400 and nothing reaches the engine", async () => {
     const { config, engine } = await fixture();
     const { call } = await start(config, engine.baseUrl);
 
@@ -135,28 +135,28 @@ describe("complete MCP ban at the HTTP and runtime boundaries", () => {
         name: "omnirush-ui",
         config: { type: "local", command, enabled: true },
       });
-      expect(response.status).toBe(403);
-      expect(await response.json()).toMatchObject({ code: "mcp_disabled" });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ code: "unsafe_mcp_command" });
     }
     expect((await readRuntimeOpencodeConfig(config, "ws_1")).mcp).toBeUndefined();
     expect(engine.pushedNames()).toEqual([]);
   });
 
-  test("PATCH /workspace/:id/config refuses MCP config before it is stored", async () => {
+  test("PATCH /workspace/:id/config refuses one with 400 and stores nothing", async () => {
     const { config, engine } = await fixture();
     const { call } = await start(config, engine.baseUrl);
 
     const response = await call("PATCH", "/workspace/ws_1/config", {
       opencode: { mcp: { "omnirush-ui": LEGACY, "user-tool": SAFE } },
     });
-    expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ code: "mcp_disabled" });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "unsafe_mcp_command" });
     expect((await readRuntimeOpencodeConfig(config, "ws_1")).mcp).toBeUndefined();
 
-    const provider = await call("PATCH", "/workspace/ws_1/config", {
-      opencode: { provider: { "user-provider": { npm: "@ai-sdk/openai" } } },
-    });
-    expect(provider.status).toBe(200);
+    // The same patch without it goes through.
+    const safe = await call("PATCH", "/workspace/ws_1/config", { opencode: { mcp: { "user-tool": SAFE } } });
+    expect(safe.status).toBe(200);
+    expect((await readRuntimeOpencodeConfig(config, "ws_1")).mcp).toEqual({ "user-tool": SAFE });
   });
 
   test("enabling a stored one over HTTP is refused and not pushed", async () => {
@@ -165,12 +165,12 @@ describe("complete MCP ban at the HTTP and runtime boundaries", () => {
     const { call } = await start(config, engine.baseUrl);
 
     const response = await call("POST", "/workspace/ws_1/mcp/omnirush-ui/enabled", { enabled: true });
-    expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ code: "mcp_disabled" });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "unsafe_mcp_command" });
     expect(engine.pushedNames()).toEqual([]);
   });
 
-  test("legacy stored rows are hidden from runtime delivery and injected config", async () => {
+  test("the dynamic engine push and the injected config file skip stored ones", async () => {
     const { config, engine } = await fixture();
     await seedRuntimeRow(config, "ws_1", { mcp: { "omnirush-ui": LEGACY, "user-tool": SAFE } });
     await seedRuntimeRow(config, ENGINE_GLOBAL_RUNTIME_CONFIG_ID, {
@@ -179,15 +179,15 @@ describe("complete MCP ban at the HTTP and runtime boundaries", () => {
     await start(config, engine.baseUrl);
 
     await syncAllWorkspacesRuntimeMcpToEngine(config);
-    expect(engine.pushedNames()).toEqual([]);
+    expect(engine.pushedNames().sort()).toEqual(["global-tool", "user-tool"]);
 
-    expect((await readEffectiveRuntimeOpencodeConfig(config, "ws_1")).mcp).toBeUndefined();
+    expect(Object.keys((await readEffectiveRuntimeOpencodeConfig(config, "ws_1")).mcp ?? {}).sort())
+      .toEqual(["global-tool", "user-tool"]);
     await writeOmniRushRuntimeConfigFile(config);
     const injected = JSON.parse(await readFile(omnirushRuntimeConfigFilePath(config), "utf8")) as { mcp?: Record<string, unknown> };
-    expect(injected.mcp).toEqual({});
+    expect(Object.keys(injected.mcp ?? {})).toEqual(["global-tool"]);
 
-    // The raw legacy row remains readable only so removal/credential cleanup
-    // can repair it; runtime and engine boundaries never expose it.
+    // Filtered on delivery, not by a hidden write: the rows are unchanged.
     expect((await readRuntimeOpencodeConfig(config, "ws_1")).mcp?.["omnirush-ui"]).toEqual(LEGACY);
   });
 

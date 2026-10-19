@@ -1834,7 +1834,13 @@ export async function proxyOpencodeV2Request(input: {
       if (!response.ok) throw new ApiError(502, "engine_skill_sync_failed", "Native skills are unavailable");
       return response.json();
     });
-    const value = buildOmniRushV2Instructions(false);
+    const mcpUrl = new URL(target);
+    mcpUrl.pathname = "/api/mcp";
+    const mcpResponse = await loopbackFetch(mcpUrl.toString(), { headers: internalHeaders, signal: AbortSignal.timeout(10_000) });
+    const mcpPayload: unknown = mcpResponse.ok ? await mcpResponse.json() : null;
+    const connectReady = isRecord(mcpPayload) && Array.isArray(mcpPayload.data) && mcpPayload.data.some((entry) =>
+      isRecord(entry) && entry.name === "omnirush-cloud" && isRecord(entry.status) && entry.status.status === "connected");
+    const value = buildOmniRushV2Instructions(connectReady);
     const instructionUrl = new URL(target);
     instructionUrl.pathname = `/api/session/${encodeURIComponent(sessionId)}/instructions/entries/${OMNIRUSH_V2_INSTRUCTION_KEY}`;
     const synced = await loopbackFetch(instructionUrl.toString(), {
@@ -4872,37 +4878,237 @@ function createRoutes(
 
   addRoute(routes, "POST", "/workspace/:id/mcp-apps/resolve", "client", async (ctx) => {
     assertMcpAllowed(config);
+    requireClientScope(ctx, "viewer");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const projectedToolName = typeof body.projectedToolName === "string" ? body.projectedToolName.trim() : "";
+    const launch = body.launch && typeof body.launch === "object" && !Array.isArray(body.launch)
+      ? body.launch as Record<string, unknown>
+      : null;
+    try {
+      const app = launch && typeof launch.connectionId === "string"
+        ? await resolveConnectMcpAppResource({
+            serverConfig: config,
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.path,
+            launch: {
+              connectionId: typeof launch.connectionId === "string" ? launch.connectionId : "",
+              toolName: typeof launch.toolName === "string" ? launch.toolName : "",
+              resourceUri: typeof launch.resourceUri === "string" ? launch.resourceUri : "",
+            },
+          })
+        : launch
+          ? await resolveSameServerMcpAppResource({
+              serverConfig: config,
+              workspaceId: workspace.id,
+              workspaceRoot: workspace.path,
+              projectedToolName,
+              launch: {
+                toolName: typeof launch.toolName === "string" ? launch.toolName : "",
+                resourceUri: typeof launch.resourceUri === "string" ? launch.resourceUri : "",
+              },
+            })
+        : await resolveMcpAppResource({
+            serverConfig: config,
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.path,
+            projectedToolName,
+          });
+      return jsonResponse({ app });
+    } catch (error) {
+      rethrowMcpAppHostError(error);
+    }
   });
 
-  addRoute(routes, "POST", "/workspace/:id/mcp-apps/call", "client", async () => {
+  addRoute(routes, "POST", "/workspace/:id/mcp-apps/call", "client", async (ctx) => {
     assertMcpAllowed(config);
+    requireClientScope(ctx, "viewer");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const serverName = typeof body.serverName === "string" ? body.serverName.trim() : "";
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const resourceUri = typeof body.resourceUri === "string" ? body.resourceUri.trim() : "";
+    const args = body.arguments && typeof body.arguments === "object" && !Array.isArray(body.arguments)
+      ? body.arguments as Record<string, unknown>
+      : {};
+    const approved = body.approved === true;
+    if (!serverName || !name) throw new ApiError(400, "invalid_payload", "serverName and name are required");
+    if (approved) requireClientScope(ctx, "collaborator");
+    try {
+      return jsonResponse(await callMcpAppTool({
+        serverConfig: config,
+        workspaceId: workspace.id,
+        workspaceRoot: workspace.path,
+        serverName,
+        name,
+        resourceUri,
+        arguments: args,
+        approved,
+      }));
+    } catch (error) {
+      rethrowMcpAppHostError(error);
+    }
   });
 
-  addRoute(routes, "POST", "/workspace/:id/mcp/managed", "client", async () => {
+  addRoute(routes, "POST", "/workspace/:id/mcp/managed", "client", async (ctx) => {
     assertMcpAllowed(config);
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const name = String(body.name ?? "").trim();
+    validateUserMcpName(name);
+    const serverUrl = typeof body.url === "string" ? body.url.trim() : "";
+    const oauth = body.oauth && typeof body.oauth === "object" && !Array.isArray(body.oauth)
+      ? body.oauth as Record<string, unknown>
+      : {};
+    if (!serverUrl) throw new ApiError(400, "invalid_payload", "Managed MCP URL is required");
+    const requestedScopes = Array.isArray(oauth.requestedScopes)
+      ? oauth.requestedScopes.filter((scope): scope is string => typeof scope === "string" && scope.trim().length > 0)
+      : [];
+    if ((await listMcp(config, workspace.id, workspace.path)).some((item) => item.name === name)) {
+      throw new ApiError(409, "mcp_exists", `MCP ${name} already exists in this workspace`);
+    }
+    await requireApproval(ctx, {
+      workspaceId: workspace.id,
+      action: "mcp.add",
+      summary: `Add OmniRush.ai-managed MCP ${name}`,
+      paths: [omnirushConfigPath(workspace.path)],
+    });
+    await createLocalManagedMcpConnection(config, {
+      workspaceId: workspace.id,
+      name,
+      serverUrl,
+      oauth: {
+        applicationType: oauth.applicationType === "web" ? "web" : "native",
+        requestedScopes,
+        ...(typeof oauth.authorizationServerIssuer === "string" && oauth.authorizationServerIssuer.trim()
+          ? { authorizationServerIssuer: oauth.authorizationServerIssuer.trim() }
+          : {}),
+        ...(typeof oauth.clientId === "string" && oauth.clientId.trim() ? { clientId: oauth.clientId.trim() } : {}),
+        ...(typeof oauth.clientSecret === "string" && oauth.clientSecret.trim() ? { clientSecret: oauth.clientSecret.trim() } : {}),
+      },
+    });
+    const result = await (async () => {
+      try {
+        return await startLocalManagedMcpAuthorization(config, workspace.id, name);
+      } catch (error) {
+        await deleteLocalManagedMcp(config, workspace.id, name).catch(() => undefined);
+        if (error instanceof ApiError) throw error;
+        const cause = (error instanceof Error ? error.message : String(error)).trim().slice(0, 300);
+        throw new ApiError(
+          502,
+          "managed_mcp_connection_failed",
+          `OmniRush.ai could not start sign-in with this MCP server. Check the server URL, OAuth settings, and network connection, then try again.${cause ? ` (${cause})` : ""}`,
+          cause ? { cause } : undefined,
+        );
+      }
+    })();
+    await syncRuntimeMcpToOpencodeEngine(config, workspace, [name], undefined, engineMcpServerState).catch(() => undefined);
+    await recordAudit(workspace.path, {
+      id: shortId(),
+      workspaceId: workspace.id,
+      actor: ctx.actor ?? { type: "remote" },
+      action: "mcp.add",
+      target: omnirushConfigPath(workspace.path),
+      summary: `Added OmniRush.ai-managed MCP ${name}`,
+      timestamp: Date.now(),
+    });
+    emitReloadEvent(ctx.reloadEvents, workspace, "mcp", { type: "mcp", name, action: "added" });
+    return jsonResponse(result, 201);
   });
 
-  addRoute(routes, "GET", "/workspace/:id/mcp/:name/managed", "client", async () => {
+  addRoute(routes, "GET", "/workspace/:id/mcp/:name/managed", "client", async (ctx) => {
     assertMcpAllowed(config);
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    return jsonResponse(await getLocalManagedMcpConnection(config, workspace.id, ctx.params.name ?? ""));
   });
 
-  addRoute(routes, "POST", "/workspace/:id/mcp/:name/managed/connect", "client", async () => {
+  addRoute(routes, "POST", "/workspace/:id/mcp/:name/managed/connect", "client", async (ctx) => {
     assertMcpAllowed(config);
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const name = String(ctx.params.name ?? "").trim();
+    validateMcpName(name);
+    const result = await startLocalManagedMcpAuthorization(config, workspace.id, name);
+    await syncRuntimeMcpToOpencodeEngine(config, workspace, [name], undefined, engineMcpServerState).catch(() => undefined);
+    return jsonResponse(result);
   });
 
-  addRoute(routes, "GET", "/mcp/oauth/callback", "none", async () => {
+  addRoute(routes, "GET", "/mcp/oauth/callback", "none", async (ctx) => {
     assertMcpAllowed(config);
+    const state = ctx.url.searchParams.get("state") ?? "";
+    const code = ctx.url.searchParams.get("code") ?? "";
+    if (!state || !code) throw new ApiError(400, "managed_mcp_oauth_callback_invalid", "OAuth callback is missing code or state");
+    const { connection, workspaceId } = await completeLocalManagedMcpAuthorization(config, state, code, ctx.url.searchParams.get("iss") ?? undefined);
+    const workspace = config.workspaces.find((item) => item.id === workspaceId);
+    if (workspace) {
+      await syncRuntimeMcpToOpencodeEngine(config, workspace, [connection.name], undefined, engineMcpServerState).catch(() => undefined);
+    }
+    return new Response(
+      `<!doctype html><meta charset="utf-8"><title>Connected</title><main style="font:16px system-ui;padding:40px;max-width:560px"><h1>Connected</h1><p>${connection.name} is ready in OmniRush.ai. You can close this window.</p><script>setTimeout(()=>window.close(),1200)</script></main>`,
+      { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } },
+    );
   });
 
-  const managedGatewayHandler = async () => {
+  const managedGatewayHandler = async (ctx: RequestContext) => {
     assertMcpAllowed(config);
+    return handleLocalManagedMcpGateway(
+      config,
+      ctx.request,
+      ctx.params.workspaceId ?? "",
+      ctx.params.name ?? "",
+    );
   };
   addRoute(routes, "POST", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
   addRoute(routes, "GET", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
   addRoute(routes, "DELETE", "/mcp/managed/:workspaceId/:name", "none", managedGatewayHandler);
 
-  addRoute(routes, "POST", "/workspace/:id/mcp", "client", async () => {
+  addRoute(routes, "POST", "/workspace/:id/mcp", "client", async (ctx) => {
     assertMcpAllowed(config);
+    ensureWritable(config);
+    requireClientScope(ctx, "collaborator");
+    const workspace = await resolveWorkspace(config, ctx.params.id);
+    const body = await readJsonBody(ctx.request);
+    const name = String(body.name ?? "");
+    validateUserMcpName(name);
+    const configPayload = body.config as Record<string, unknown> | undefined;
+    if (!configPayload) {
+      throw new ApiError(400, "invalid_payload", "MCP config is required");
+    }
+    await requireApproval(ctx, {
+      workspaceId: workspace.id,
+      action: "mcp.add",
+      summary: `Add MCP ${name}`,
+      paths: [omnirushConfigPath(workspace.path)],
+    });
+    const result = await addMcp(config, workspace.id, name, configPayload);
+    // Hot-add into the running engine so connect/auth works immediately,
+    // without waiting for an engine instance rebuild.
+    await syncRuntimeMcpToOpencodeEngine(
+      config,
+      workspace,
+      [name],
+      undefined,
+      engineMcpServerState,
+    ).catch(() => undefined);
+    await recordAudit(workspace.path, {
+      id: shortId(),
+      workspaceId: workspace.id,
+      actor: ctx.actor ?? { type: "remote" },
+      action: "mcp.add",
+      target: omnirushConfigPath(workspace.path),
+      summary: `Added MCP ${name}`,
+      timestamp: Date.now(),
+    });
+    emitReloadEvent(ctx.reloadEvents, workspace, "mcp", {
+      type: "mcp",
+      name,
+      action: result.action,
+    });
+    const items = await listMcp(config, workspace.id, workspace.path);
+    return jsonResponse({ items });
   });
 
   addRoute(routes, "DELETE", "/workspace/:id/mcp/:name", "client", async (ctx) => {

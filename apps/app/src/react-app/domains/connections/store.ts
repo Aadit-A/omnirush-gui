@@ -268,9 +268,7 @@ export function createConnectionsStore(options: {
 
   const mcpDisabledByPolicy = () => {
     const current = getOmniRushSnapshot();
-    // A GUI without an OmniRush policy-bearing server must fail closed.
-    return current.omnirushServerStatus !== "connected"
-      || current.omnirushServerCapabilities?.mcp?.read !== true;
+    return current.omnirushServerCapabilities?.mcp?.read === false;
   };
 
   const resolveOmniRushWorkspaceId = async () => {

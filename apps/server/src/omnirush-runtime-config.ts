@@ -41,12 +41,14 @@ import {
   isEngineGlobalRuntimeConfigId,
   readGlobalRuntimeOpencodeConfig,
   runtimeDisabledProviderList,
+  runtimeMcpMap,
   runtimeProviderMap,
   runtimePluginList,
   type RuntimeOpencodeConfig,
 } from "./runtime-opencode-config-store.js";
 import { OMNIRUSH_AGENT_PROMPT } from "./omnirush-agent-prompt.js";
 import { OMNIRUSH_SUBAGENT_DEPTH, OMNIRUSH_SWARM_SKILL_NAME, OMNIRUSH_SWARM_TOOL_NAME, omnirushSwarmSkillMarkdown } from "./omnirush-swarm.js";
+import { withoutOmniRushUiMcpRegistryEntries } from "./omnirush-ui-mcp-command.js";
 import {
   builtinOmniRushModelCatalog,
   engineModelsFromCatalog,
@@ -220,7 +222,7 @@ export function buildOmniRushRuntimeConfigObjectFromSnapshot(
   const disabledProviders = runtimeDisabledProviderList(runtimeConfig);
   // OMNIRUSH_APPROVALS in the server environment wins over the persisted setting.
   const permissions = legacyExecutionPermissions(runtimeConfig.managedPolicy?.execution, resolveApprovalMode(runtimeConfig, env).mode);
-  const mcpPermission = { "mcp.*": "deny" };
+  const mcpPermission = { "mcp.*": "allow" };
   const { managedPolicy: _managedPolicy, approvals: _approvals, bestPractices: _bestPractices, ...engineConfig } = runtimeConfig;
   const enabled = bestPracticesEnabled(runtimeConfig);
   const skillPaths = [
@@ -300,14 +302,10 @@ export function buildOmniRushRuntimeConfigObjectFromSnapshot(
     plugin: [
       ...omnirushLeadingPluginPaths(),
       ...runtimePluginList(runtimeConfig),
-      // This must be last: user/runtime plugins may not reintroduce MCP
-      // configuration or replace the deny rules.
       omnirushMcpPolicyPluginPath(),
     ],
     ...(disabledProviders.length ? { disabled_providers: disabledProviders } : {}),
-    // MCP is a permanently disabled capability. The policy plugin also
-    // strips project/global MCP entries that the engine discovers itself.
-    mcp: {},
+    mcp: withoutOmniRushUiMcpRegistryEntries(runtimeMcpMap(runtimeConfig)),
     ...(Object.keys(provider).length ? { provider } : {}),
   };
 }

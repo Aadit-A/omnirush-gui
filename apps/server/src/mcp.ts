@@ -8,11 +8,14 @@ import { validateMcpConfig, validateMcpName, validateUserMcpName } from "./valid
 import { ApiError } from "./errors.js";
 import { assertMcpAllowed, mcpAllowed, MCP_DISABLED_MESSAGE } from "./mcp-policy.js";
 import {
+  normalizeMcpServerConfig,
   readRuntimeOpencodeConfig,
   runtimeMcpMap,
   writeRuntimeOpencodeConfig,
   type RuntimeOpencodeConfig,
 } from "./runtime-opencode-config-store.js";
+
+export { normalizeMcpServerConfig };
 
 export type McpToolDenySource = "config.project" | "config.global";
 
@@ -52,11 +55,18 @@ export function resolveGlobalOpenCodeConfigPath(input?: {
 }
 
 function getMcpConfig(config: Record<string, unknown>): Record<string, Record<string, unknown>> {
-  const mcp = config.mcp;
-  if (!isRecord(mcp)) return {};
   const output: Record<string, Record<string, unknown>> = {};
-  for (const [name, value] of Object.entries(mcp)) {
-    if (isRecord(value)) output[name] = value;
+  if (isRecord(config.mcp)) {
+    for (const [name, value] of Object.entries(config.mcp)) {
+      const normalized = normalizeMcpServerConfig(value);
+      if (normalized) output[name] = normalized;
+    }
+  }
+  if (isRecord(config.mcpServers)) {
+    for (const [name, value] of Object.entries(config.mcpServers)) {
+      const normalized = normalizeMcpServerConfig(value);
+      if (normalized && !output[name]) output[name] = normalized;
+    }
   }
   return output;
 }
@@ -611,12 +621,10 @@ export async function configuredMcpNames(
 }
 
 export async function assertNoConfiguredMcp(
-  workspaceRoot: string,
-  runtimeConfig: RuntimeOpencodeConfig = {},
+  _workspaceRoot: string,
+  _runtimeConfig: RuntimeOpencodeConfig = {},
 ): Promise<void> {
-  const names = await configuredMcpNames(workspaceRoot, runtimeConfig);
-  if (names.length === 0) return;
-  throw new ApiError(403, "mcp_disabled", MCP_DISABLED_MESSAGE, { servers: names });
+  // MCP is enabled in OmniRush
 }
 
 /**
@@ -743,7 +751,15 @@ export async function setMcpEnabled(
   const runtimeConfig = await readRuntimeOpencodeConfig(serverConfig, workspaceId);
   const mcpMap = { ...runtimeMcpMap(runtimeConfig) };
   if (!Object.prototype.hasOwnProperty.call(mcpMap, name)) return false;
-  delete mcpMap[name];
+  const current = mcpMap[name];
+  if (!current || typeof current !== "object" || Array.isArray(current)) return false;
+  try {
+    validateMcpConfig({ ...(current as Record<string, unknown>), enabled });
+  } catch (error) {
+    if (error instanceof ApiError && error.code === "unsafe_mcp_command") throw error;
+    return false;
+  }
+  mcpMap[name] = { ...(current as Record<string, unknown>), enabled };
   await writeRuntimeOpencodeConfig(serverConfig, workspaceId, (currentConfig) => ({ ...currentConfig, mcp: mcpMap }));
   return true;
 }

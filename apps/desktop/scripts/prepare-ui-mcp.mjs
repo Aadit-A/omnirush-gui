@@ -37,7 +37,7 @@ export function prepareUiMcp(outdir = defaultOutdir) {
     "--target", "node",
     "--format", "esm",
     "--outfile", outfile,
-  ], { cwd: repoRoot, stdio: "inherit" });
+  ], { cwd: repoRoot, stdio: "inherit", shell: process.platform === "win32" });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`bun build failed for the UI-control MCP (status ${result.status}).`);
 

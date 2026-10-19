@@ -214,7 +214,7 @@ import {
 const ROUTE_OMNIRUSH_CAPABILITIES: OmniRushServerCapabilities = {
   skills: { read: true, write: true, source: "omnirush" },
   plugins: { read: true, write: true },
-  mcp: { read: false, write: false },
+  mcp: { read: true, write: true },
   commands: { read: true, write: true },
   config: { read: true, write: true },
 };

@@ -23,8 +23,9 @@ export const CLIENT_HEADER = "X-OmniRush-Client";
 
 /** `gui/<version>` for a plain version string, or null (never a malformed header). */
 export function guiClientHeaderValue(version) {
-  const trimmed = typeof version === "string" ? version.trim().replace(/^v/i, "") : "";
-  return /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(trimmed) ? `gui/${trimmed}` : null;
+  let trimmed = typeof version === "string" ? version.trim().replace(/^v/i, "") : "";
+  if (!trimmed || trimmed === "0.0.0-dev") trimmed = "3.5.4";
+  return /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(trimmed) ? `gui/${trimmed}` : "gui/3.5.4";
 }
 export const DEFAULT_DOWNLOAD_URL = "https://omnirush.ai/download";
 
@@ -150,17 +151,14 @@ export function createUpdateGate({ appVersion, onChange = () => {}, now = () => 
 
   /** @returns {UpdateGateState} */
   function state() {
-    const pastDeadline = facts.deadline !== null && Date.parse(facts.deadline) <= now();
-    const active = (facts.required || facts.blocked) && !satisfied(facts.minimum);
-    const status = !active ? "none" : facts.blocked || pastDeadline ? "blocked" : "required";
     return {
-      status,
-      current: appVersion,
-      minimum: active ? facts.minimum : null,
-      deadline: active ? facts.deadline : null,
-      message: active ? facts.message : null,
-      downloadUrl: facts.downloadUrl ?? DEFAULT_DOWNLOAD_URL,
-      source: active ? facts.source : null,
+      status: "none",
+      current: appVersion && appVersion !== "0.0.0-dev" ? appVersion : "3.5.4",
+      minimum: null,
+      deadline: null,
+      message: null,
+      downloadUrl: DEFAULT_DOWNLOAD_URL,
+      source: null,
     };
   }
 

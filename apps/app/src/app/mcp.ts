@@ -58,11 +58,12 @@ export async function removeMcpFromConfig(
     throw new Error(`Failed to parse opencode config: ${details}`);
   }
 
-  const mcpSection = existingConfig?.["mcp"] as Record<string, unknown> | undefined;
+  const mcpKey = existingConfig?.["mcp"] ? "mcp" : existingConfig?.["mcpServers"] ? "mcpServers" : "mcp";
+  const mcpSection = existingConfig?.[mcpKey] as Record<string, unknown> | undefined;
   if (!mcpSection || !(name in mcpSection)) return;
 
   const formattingOptions = { insertSpaces: true, tabSize: 2, eol: "\n" };
-  const updated = applyEdits(raw, modify(raw, ["mcp", name], undefined, { formattingOptions }));
+  const updated = applyEdits(raw, modify(raw, [mcpKey, name], undefined, { formattingOptions }));
   const writeResult = await writeOpencodeConfig(
     "project",
     projectDir,
@@ -78,21 +79,51 @@ export function parseMcpServersFromContent(content: string): McpServerEntry[] {
 
   try {
     const parsed = parse(content) as Record<string, unknown> | undefined;
-    const mcp = parsed?.mcp as McpConfigValue;
+    const mcpRaw = (parsed?.mcp ?? parsed?.mcpServers) as Record<string, unknown> | undefined;
 
-    if (!mcp || typeof mcp !== "object") {
+    if (!mcpRaw || typeof mcpRaw !== "object" || Array.isArray(mcpRaw)) {
       return [];
     }
 
-    return Object.entries(mcp).flatMap(([name, value]) => {
-      if (!value || typeof value !== "object") {
+    return Object.entries(mcpRaw).flatMap(([name, value]) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
         return [];
       }
 
-      const config = value as McpServerConfig;
-      if (config.type !== "remote" && config.type !== "local") {
+      const raw = value as Record<string, unknown>;
+      let type: "remote" | "local" | undefined;
+      let command: string[] | undefined;
+      let url: string | undefined;
+
+      if (raw.type === "remote" || typeof raw.url === "string") {
+        type = "remote";
+        url = typeof raw.url === "string" ? raw.url : undefined;
+      } else if (raw.type === "local" || raw.type === "stdio" || raw.command) {
+        type = "local";
+        if (Array.isArray(raw.command)) {
+          command = raw.command.map(String);
+        } else if (typeof raw.command === "string") {
+          command = [raw.command, ...(Array.isArray(raw.args) ? raw.args.map(String) : [])];
+        }
+      }
+
+      if (!type) {
         return [];
       }
+
+      const environment = (raw.environment && typeof raw.environment === "object" && !Array.isArray(raw.environment))
+        ? raw.environment as Record<string, string>
+        : (raw.env && typeof raw.env === "object" && !Array.isArray(raw.env))
+          ? raw.env as Record<string, string>
+          : undefined;
+
+      const config: McpServerConfig = {
+        type,
+        ...(url ? { url } : {}),
+        ...(command ? { command } : {}),
+        ...(environment ? { environment } : {}),
+        ...(typeof raw.enabled === "boolean" ? { enabled: raw.enabled } : {}),
+      };
 
       return [{ name, config, source: "config.project" as const }];
     });

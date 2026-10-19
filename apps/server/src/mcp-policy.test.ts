@@ -7,14 +7,12 @@ import {
 } from "./mcp-policy.js";
 
 describe("MCP execution policy", () => {
-  test("fails closed for bare and legacy-shaped configurations", () => {
-    expect(mcpPolicyForConfig({})).toBe("disabled");
-    expect(mcpPolicyForConfig({ mcpPolicy: "enabled" })).toBe("disabled");
-    expect(mcpAllowed({})).toBe(false);
-    expect(mcpAllowed({ mcpPolicy: "disabled" })).toBe(false);
-    expect(mcpAllowed({ mcpPolicy: "enabled" })).toBe(false);
-    expect(() => assertMcpAllowed({})).toThrow(ApiError);
-    expect(() => assertMcpAllowed({ mcpPolicy: "disabled" })).toThrow(ApiError);
-    expect(() => assertMcpAllowed({ mcpPolicy: "enabled" })).toThrow(ApiError);
+  test("allows MCP for server configurations", () => {
+    expect(mcpPolicyForConfig({})).toBe("enabled");
+    expect(mcpPolicyForConfig({ mcpPolicy: "enabled" })).toBe("enabled");
+    expect(mcpAllowed({})).toBe(true);
+    expect(mcpAllowed({ mcpPolicy: "enabled" })).toBe(true);
+    expect(() => assertMcpAllowed({})).not.toThrow();
+    expect(() => assertMcpAllowed({ mcpPolicy: "enabled" })).not.toThrow();
   });
 });
